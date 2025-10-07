@@ -4,4 +4,264 @@ metadata:
   name: cert-alert-script
   namespace: prod
 data:
-  cert_alert.py: "import base64\r\nimport os\r\nimport smtplib\r\nfrom email.mime.text import MIMEText\r\nimport logging\r\nimport requests\r\nfrom kubernetes import client, config\r\nfrom kubernetes.config.config_exception import ConfigException\r\nfrom cryptography import x509\r\nfrom cryptography.hazmat.backends import default_backend\r\nfrom datetime import datetime, timezone\r\nfrom tabulate import tabulate\r\n\r\n\r\nEMAIL_ENABLED = os.getenv(\"ALERT_ON_EMAIL\",\"Not Defined\")\r\nTEAMS_ENABLED = os.getenv(\"ALERT_ON_TEAMS\",\"Not Defined\")\r\nENVIRONMENT  = os.getenv(\"ENVIRONMENT\",\"Not Defined\")\r\n\r\n\r\nEMAIL_CONFIG = {\r\n    'smtp_server': os.getenv('SMTP_HOST', 'smtp.sendgrid.net'),\r\n    'smtp_port': int(os.getenv('SMTP_PORT', '587')),\r\n    'sender': os.getenv('SMTP_FROM_EMAIL'),\r\n    'username': os.getenv('SMTP_USER', 'apikey'),\r\n    'password': os.getenv('SMTP_PASSWORD'),\r\n    'recipients': [email.strip() for email in os.getenv('SMTP_TO_EMAILS', '').split(',') if email.strip()]\r\n}\r\n\r\nTEAMS_WEBHOOK_URL = os.getenv('TEAMS_WEBHOOK')\r\n\r\ndef send_email_alert(subject, cert_list):\r\n    if not EMAIL_ENABLED or not EMAIL_CONFIG['password'] or not EMAIL_CONFIG['recipients']:\r\n        print('Email alert disabled or missing config.')\r\n        return\r\n    try:\r\n        html = format_email_html_table(cert_list)\r\n        msg = MIMEText(html, 'html')\r\n        msg['Subject'] = subject\r\n        msg['From'] = EMAIL_CONFIG['sender']\r\n        msg['To'] = ', '.join(EMAIL_CONFIG['recipients'])\r\n        server = smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port'])\r\n        if os.getenv('SMTP_USE_TLS', 'true').lower() == 'true':\r\n            server.starttls()\r\n        server.login(EMAIL_CONFIG['username'], EMAIL_CONFIG['password'])\r\n        server.sendmail(EMAIL_CONFIG['sender'], EMAIL_CONFIG['recipients'], msg.as_string())\r\n        server.quit()\r\n        print('Email alert sent via SMTP.')\r\n    except Exception as e:\r\n        print(f'Failed to send email alert: {e}')\r\n\r\ndef truncate(text, max_len):\r\n    return text if len(text) <= max_len else text[:max_len - 3] + '...'\r\n\r\ndef init_k8s():\r\n    try:\r\n        config.load_incluster_config()\r\n        logging.info('Loaded in-cluster config.')\r\n    except ConfigException:\r\n        logging.error('Failed to load in-cluster config.')\r\n        exit(1)\r\n\r\ndef parse_cert_from_pem(pem_data):\r\n    try:\r\n        return x509.load_pem_x509_certificate(pem_data.encode(), default_backend())\r\n    except Exception as e:\r\n        logging.error(f'Failed to parse PEM certificate: {e}')\r\n        return None\r\n\r\ndef get_certificates(namespace=None):\r\n    api = client.CustomObjectsApi()\r\n    group = 'cert-manager.io'\r\n    version = 'v1'\r\n    plural = 'certificates'\r\n    try:\r\n        if namespace:\r\n            certs = api.list_namespaced_custom_object(group, version, namespace, plural)\r\n        else:\r\n            certs = api.list_cluster_custom_object(group, version, plural)\r\n        return certs.get('items', [])\r\n    except Exception as e:\r\n        logging.error(f'Error fetching cert-manager certificates: {e}')\r\n        return []\r\n\r\ndef get_secrets(namespace=None):\r\n    v1 = client.CoreV1Api()\r\n    try:\r\n        if namespace:\r\n            secrets = v1.list_namespaced_secret(namespace)\r\n        else:\r\n            secrets = v1.list_secret_for_all_namespaces()\r\n        return secrets.items\r\n    except Exception as e:\r\n        logging.error(f'Error fetching secrets: {e}')\r\n        return []\r\n\r\ndef extract_cert_from_secret(secret):\r\n    if secret.type != 'kubernetes.io/tls':\r\n        return None\r\n    crt_data = secret.data.get('tls.crt')\r\n    if not crt_data:\r\n        return None\r\n    try:\r\n        pem_bytes = base64.b64decode(crt_data).decode()\r\n        return parse_cert_from_pem(pem_bytes)\r\n    except Exception as e:\r\n        logging.error(f'Failed to extract cert from secret {secret.metadata.name}: {e}')\r\n        return None\r\n\r\ndef extract_cert_from_certmanager(cert_obj):\r\n    status = cert_obj.get('status', {})\r\n    cert_b64 = status.get('certificate')\r\n    if not cert_b64:\r\n        return None\r\n    try:\r\n        pem_data = base64.b64decode(cert_b64).decode()\r\n        return parse_cert_from_pem(pem_data)\r\n    except Exception as e:\r\n        logging.error(f'Failed to extract cert from cert-manager cert {cert_obj.get(\"metadata\", {}).get(\"name\")}: {e}')\r\n        return None\r\n\r\ndef get_domains(cert):\r\n    try:\r\n        ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)\r\n        return ext.value.get_values_for_type(x509.DNSName)\r\n    except Exception:\r\n        try:\r\n            return [cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value]\r\n        except Exception:\r\n            return []\r\n\r\ndef get_days_until_expiry(cert):\r\n    expire_date = cert.not_valid_after_utc\r\n    now = datetime.now(timezone.utc)\r\n    return (expire_date - now).days\r\n\r\ndef format_email_html_table(cert_list):\r\n    html = \"\"\"\r\n    <html>\r\n    <body>\r\n    <h2>Certificate Expiry Alert</h2>\r\n    <table border=\"1\" cellpadding=\"5\" cellspacing=\"0\" style=\"border-collapse: collapse;\">\r\n      <thead>\r\n        <tr>\r\n          <th>Cert Name</th>\r\n          <th>Domains</th>\r\n          <th>Days Left</th>\r\n          <th>Expiry (UTC)</th>\r\n          <th>Namespace</th>\r\n        </tr>\r\n      </thead>\r\n      <tbody>\r\n    \"\"\"\r\n    for item in cert_list:\r\n        html += f\"\"\"\r\n        <tr>\r\n          <td>{truncate(item['name'], 25)}</td>\r\n          <td>{truncate(', '.join(item['domains']), 40)}</td>\r\n          <td>{item['days_remaining']}</td>\r\n          <td>{item['expiry_date'].strftime('%Y-%m-%d')}</td>\r\n          <td>{item['namespace']}</td>\r\n        </tr>\r\n        \"\"\"\r\n    html += \"\"\"\r\n      </tbody>\r\n    </table>\r\n    </body>\r\n    </html>\r\n    \"\"\"\r\n    return html\r\n\r\ndef format_for_teams_table(cert_list):\r\n    headers = ['Cert Name', 'Domains', 'Days Left', 'Expiry (UTC)', 'Namespace']\r\n    rows = []\r\n    for item in cert_list:\r\n        rows.append([\r\n            truncate(item['name'], 25),\r\n            truncate(', '.join(item['domains']), 40),\r\n            item['days_remaining'],\r\n            item['expiry_date'].strftime('%Y-%m-%d'),\r\n            item['namespace']\r\n        ])\r\n    table_text = tabulate(rows, headers=headers, tablefmt='grid')\r\n    return f\"```\\n{table_text}\\n```\"\r\n\r\ndef send_teams_alert(cert_list, subject=None):\r\n    subject = f\"Alert : Certificate Expiring on {ENVIRONMENT} environment\"\r\n    if not TEAMS_ENABLED or not TEAMS_WEBHOOK_URL:\r\n        return\r\n    try:\r\n        if cert_list:\r\n            body = format_for_teams_table(cert_list)\r\n        else:\r\n            body = \"✅ No certificates are expiring in the next 30 days.\"\r\n        message = f\"**{subject}**\\n\\n{body}\"\r\n        payload = {'text': message}\r\n        resp = requests.post(TEAMS_WEBHOOK_URL, json=payload)\r\n        if resp.status_code == 200:\r\n            print('Teams alert sent.')\r\n        else:\r\n            print(f'Teams alert failed with status code {resp.status_code}')\r\n    except Exception as e:\r\n      print(f'Failed to send Teams alert: {e}')\r\n\r\ndef main():\r\n    logging.basicConfig(level=logging.INFO)\r\n    init_k8s()\r\n\r\n    namespace = None  \r\n    days_before_expiry = 30\r\n\r\n    all_certs = []\r\n\r\n    certs = get_certificates(namespace)\r\n    for cert_obj in certs:\r\n        cert = extract_cert_from_certmanager(cert_obj)\r\n        if cert:\r\n            all_certs.append({\r\n                'name': cert_obj['metadata']['name'],\r\n                'namespace': cert_obj['metadata']['namespace'],\r\n                'expiry_date': cert.not_valid_after_utc,\r\n                'days_remaining': get_days_until_expiry(cert),\r\n                'domains': get_domains(cert)\r\n            })\r\n\r\n    secrets = get_secrets(namespace)\r\n    for secret in secrets:\r\n        cert = extract_cert_from_secret(secret)\r\n        if cert:\r\n            all_certs.append({\r\n                'name': secret.metadata.name,\r\n                'namespace': secret.metadata.namespace,\r\n                'expiry_date': cert.not_valid_after_utc,\r\n                'days_remaining': get_days_until_expiry(cert),\r\n                'domains': get_domains(cert)\r\n            })\r\n\r\n    if not all_certs:\r\n        print('No certificates found.')\r\n        return\r\n\r\n    print('\\nAll Certificates:\\n')\r\n    print(tabulate([\r\n        [truncate(c['name'], 25), truncate(', '.join(c['domains']), 40), c['days_remaining'], c['expiry_date'].strftime('%Y-%m-%d'), c['namespace']]\r\n        for c in all_certs\r\n    ], headers=['Cert Name', 'Domains', 'Days Left', 'Expiry (UTC)', 'Namespace'], tablefmt='fancy_grid'))\r\n\r\n    expiring = [c for c in all_certs if c['days_remaining'] <= days_before_expiry]\r\n\r\n    if expiring:\r\n        print('\\nExpiring Certificates (<= 30 days):\\n')\r\n        print(tabulate([\r\n            [truncate(c['name'], 25), truncate(', '.join(c['domains']), 40), c['days_remaining'], c['expiry_date'].strftime('%Y-%m-%d'), c['namespace']]\r\n            for c in expiring\r\n        ], headers=['Cert Name', 'Domains', 'Days Left', 'Expiry (UTC)', 'Namespace'], tablefmt='fancy_grid'))\r\n\r\n        alert_msg_subject = 'Alert : Certificate Expiring on '+ENVIRONMENT+' Environment'\r\n        send_email_alert(alert_msg_subject, expiring)\r\n        send_teams_alert(expiring)\r\n\r\nif __name__ == '__main__':\r\n    main()"
+  cert_alert.py: |
+    import base64
+    import os
+    import smtplib
+    from email.mime.text import MIMEText
+    import logging
+    import requests
+    from kubernetes import client, config
+    from kubernetes.config.config_exception import ConfigException
+    from cryptography import x509
+    from cryptography.hazmat.backends import default_backend
+    from datetime import datetime, timezone
+    from tabulate import tabulate
+
+    EMAIL_ENABLED = os.getenv("ALERT_ON_EMAIL","Not Defined")
+    TEAMS_ENABLED = os.getenv("ALERT_ON_TEAMS","Not Defined")
+    ENVIRONMENT  = os.getenv("ENVIRONMENT","Not Defined")
+    EXPIRY_DAYS = int(os.getenv("EXPIRY_DAYS", "30"))   # <-- NEW CONFIGURABLE VALUE
+
+    EMAIL_CONFIG = {
+        'smtp_server': os.getenv('SMTP_HOST', 'smtp.sendgrid.net'),
+        'smtp_port': int(os.getenv('SMTP_PORT', '587')),
+        'sender': os.getenv('SMTP_FROM_EMAIL'),
+        'username': os.getenv('SMTP_USER', 'apikey'),
+        'password': os.getenv('SMTP_PASSWORD'),
+        'recipients': [email.strip() for email in os.getenv('SMTP_TO_EMAILS', '').split(',') if email.strip()]
+    }
+
+    TEAMS_WEBHOOK_URL = os.getenv('TEAMS_WEBHOOK')
+
+    def send_email_alert(subject, cert_list):
+        if not EMAIL_ENABLED or not EMAIL_CONFIG['password'] or not EMAIL_CONFIG['recipients']:
+            print('Email alert disabled or missing config.')
+            return
+        try:
+            html = format_email_html_table(cert_list)
+            msg = MIMEText(html, 'html')
+            msg['Subject'] = subject
+            msg['From'] = EMAIL_CONFIG['sender']
+            msg['To'] = ', '.join(EMAIL_CONFIG['recipients'])
+            server = smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port'])
+            if os.getenv('SMTP_USE_TLS', 'true').lower() == 'true':
+                server.starttls()
+            server.login(EMAIL_CONFIG['username'], EMAIL_CONFIG['password'])
+            server.sendmail(EMAIL_CONFIG['sender'], EMAIL_CONFIG['recipients'], msg.as_string())
+            server.quit()
+            print('Email alert sent via SMTP.')
+        except Exception as e:
+            print(f'Failed to send email alert: {e}')
+
+    def truncate(text, max_len):
+        return text if len(text) <= max_len else text[:max_len - 3] + '...'
+
+    def init_k8s():
+        try:
+            config.load_incluster_config()
+            logging.info('Loaded in-cluster config.')
+        except ConfigException:
+            logging.error('Failed to load in-cluster config.')
+            exit(1)
+
+    def parse_cert_from_pem(pem_data):
+        try:
+            return x509.load_pem_x509_certificate(pem_data.encode(), default_backend())
+        except Exception as e:
+            logging.error(f'Failed to parse PEM certificate: {e}')
+            return None
+
+    def get_certificates(namespace=None):
+        api = client.CustomObjectsApi()
+        group = 'cert-manager.io'
+        version = 'v1'
+        plural = 'certificates'
+        try:
+            if namespace:
+                certs = api.list_namespaced_custom_object(group, version, namespace, plural)
+            else:
+                certs = api.list_cluster_custom_object(group, version, plural)
+            return certs.get('items', [])
+        except Exception as e:
+            logging.error(f'Error fetching cert-manager certificates: {e}')
+            return []
+
+    def get_secrets(namespace=None):
+        v1 = client.CoreV1Api()
+        try:
+            if namespace:
+                secrets = v1.list_namespaced_secret(namespace)
+            else:
+                secrets = v1.list_secret_for_all_namespaces()
+            return secrets.items
+        except Exception as e:
+            logging.error(f'Error fetching secrets: {e}')
+            return []
+
+    def extract_cert_from_secret(secret):
+        if secret.type != 'kubernetes.io/tls':
+            return None
+        crt_data = secret.data.get('tls.crt')
+        if not crt_data:
+            return None
+        try:
+            pem_bytes = base64.b64decode(crt_data).decode()
+            return parse_cert_from_pem(pem_bytes)
+        except Exception as e:
+            logging.error(f'Failed to extract cert from secret {secret.metadata.name}: {e}')
+            return None
+
+    def extract_cert_from_certmanager(cert_obj):
+        status = cert_obj.get('status', {})
+        cert_b64 = status.get('certificate')
+        if not cert_b64:
+            return None
+        try:
+            pem_data = base64.b64decode(cert_b64).decode()
+            return parse_cert_from_pem(pem_data)
+        except Exception as e:
+            logging.error(f'Failed to extract cert from cert-manager cert {cert_obj.get("metadata", {}).get("name")}: {e}')
+            return None
+
+    def get_domains(cert):
+        try:
+            ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+            return ext.value.get_values_for_type(x509.DNSName)
+        except Exception:
+            try:
+                return [cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value]
+            except Exception:
+                return []
+
+    def get_days_until_expiry(cert):
+        expire_date = cert.not_valid_after_utc
+        now = datetime.now(timezone.utc)
+        return (expire_date - now).days
+
+    def format_email_html_table(cert_list):
+        html = """
+        <html>
+        <body>
+        <h2>Certificate Expiry Alert</h2>
+        <table border="1" cellpadding="5" cellspacing="0" style="border-collapse: collapse;">
+          <thead>
+            <tr>
+              <th>Cert Name</th>
+              <th>Domains</th>
+              <th>Days Left</th>
+              <th>Expiry (UTC)</th>
+              <th>Namespace</th>
+            </tr>
+          </thead>
+          <tbody>
+        """
+        for item in cert_list:
+            html += f"""
+            <tr>
+              <td>{truncate(item['name'], 25)}</td>
+              <td>{truncate(', '.join(item['domains']), 40)}</td>
+              <td>{item['days_remaining']}</td>
+              <td>{item['expiry_date'].strftime('%Y-%m-%d')}</td>
+              <td>{item['namespace']}</td>
+            </tr>
+            """
+        html += """
+          </tbody>
+        </table>
+        </body>
+        </html>
+        """
+        return html
+
+    def format_for_teams_table(cert_list):
+        headers = ['Cert Name', 'Domains', 'Days Left', 'Expiry (UTC)', 'Namespace']
+        rows = []
+        for item in cert_list:
+            rows.append([
+                truncate(item['name'], 25),
+                truncate(', '.join(item['domains']), 40),
+                item['days_remaining'],
+                item['expiry_date'].strftime('%Y-%m-%d'),
+                item['namespace']
+            ])
+        table_text = tabulate(rows, headers=headers, tablefmt='grid')
+        return f"```\n{table_text}\n```"
+
+    def send_teams_alert(cert_list, subject=None):
+        subject = f"Alert : Certificate Expiring on {ENVIRONMENT} environment"
+        if not TEAMS_ENABLED or not TEAMS_WEBHOOK_URL:
+            return
+        try:
+            if cert_list:
+                body = format_for_teams_table(cert_list)
+            else:
+                body = f"✅ No certificates are expiring in the next {EXPIRY_DAYS} days."
+            message = f"**{subject}**\n\n{body}"
+            payload = {'text': message}
+            resp = requests.post(TEAMS_WEBHOOK_URL, json=payload)
+            if resp.status_code == 200:
+                print('Teams alert sent.')
+            else:
+                print(f'Teams alert failed with status code {resp.status_code}')
+        except Exception as e:
+          print(f'Failed to send Teams alert: {e}')
+
+    def main():
+        logging.basicConfig(level=logging.INFO)
+        init_k8s()
+
+        namespace = None  
+        days_before_expiry = EXPIRY_DAYS   # <-- USE ENV VALUE
+
+        all_certs = []
+
+        certs = get_certificates(namespace)
+        for cert_obj in certs:
+            cert = extract_cert_from_certmanager(cert_obj)
+            if cert:
+                all_certs.append({
+                    'name': cert_obj['metadata']['name'],
+                    'namespace': cert_obj['metadata']['namespace'],
+                    'expiry_date': cert.not_valid_after_utc,
+                    'days_remaining': get_days_until_expiry(cert),
+                    'domains': get_domains(cert)
+                })
+
+        secrets = get_secrets(namespace)
+        for secret in secrets:
+            cert = extract_cert_from_secret(secret)
+            if cert:
+                all_certs.append({
+                    'name': secret.metadata.name,
+                    'namespace': secret.metadata.namespace,
+                    'expiry_date': cert.not_valid_after_utc,
+                    'days_remaining': get_days_until_expiry(cert),
+                    'domains': get_domains(cert)
+                })
+
+        if not all_certs:
+            print('No certificates found.')
+            return
+
+        print('\nAll Certificates:\n')
+        print(tabulate([
+            [truncate(c['name'], 25), truncate(', '.join(c['domains']), 40), c['days_remaining'], c['expiry_date'].strftime('%Y-%m-%d'), c['namespace']]
+            for c in all_certs
+        ], headers=['Cert Name', 'Domains', 'Days Left', 'Expiry (UTC)', 'Namespace'], tablefmt='fancy_grid'))
+
+        expiring = [c for c in all_certs if c['days_remaining'] <= days_before_expiry]
+
+        if expiring:
+            print(f'\nExpiring Certificates (<= {days_before_expiry} days):\n')
+            print(tabulate([
+                [truncate(c['name'], 25), truncate(', '.join(c['domains']), 40), c['days_remaining'], c['expiry_date'].strftime('%Y-%m-%d'), c['namespace']]
+                for c in expiring
+            ], headers=['Cert Name', 'Domains', 'Days Left', 'Expiry (UTC)', 'Namespace'], tablefmt='fancy_grid'))
+
+            alert_msg_subject = f'Alert : Certificate Expiring on {ENVIRONMENT} Environment'
+            send_email_alert(alert_msg_subject, expiring)
+            send_teams_alert(expiring)
+
+    if __name__ == '__main__':
+        main()
