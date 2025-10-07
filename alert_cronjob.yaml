@@ -1,0 +1,51 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ssl-cert-expiry-alert
+  namespace: prod
+spec:
+  schedule: "0 0 * * *"  
+  concurrencyPolicy: Allow
+  suspend: false
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: certread-sa
+          restartPolicy: OnFailure
+          terminationGracePeriodSeconds: 30
+          dnsPolicy: ClusterFirst
+          containers:
+            - name: cert-alert
+              image: python:3.11-slim
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  pip install cryptography kubernetes tabulate requests >/dev/null 2>&1
+                  python /scripts/cert_alert.py "$ALERT_ON_EMAIL" "$ALERT_ON_TEAMS" "$ENVIRONMENT"
+              volumeMounts:
+                - name: script-volume
+                  mountPath: /scripts
+                  readOnly: true
+              envFrom:
+                - configMapRef:
+                    name: ssl-expiry-alery-job-config
+              env:
+                - name: SMTP_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: smtp-secure-connection
+                      key: password
+                - name: TEAMS_WEBHOOK
+                  valueFrom:
+                    secretKeyRef:
+                      name: certexpiry-teams-webhook
+                      key: webhook
+          volumes:
+            - name: script-volume
+              configMap:
+                name: cert-alert-script
+                defaultMode: 0755
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
