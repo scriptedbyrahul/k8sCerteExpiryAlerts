@@ -60,8 +60,8 @@ Role/ServiceAccount provides limited RBAC read access.
 
 ### 1️⃣ Clone the Repository
 ```bash
-git clone https://github.com/<your-org>/<repo-name>.git
-cd <repo-name>
+git clone [https://github.com/<your-org>/<repo-name>.git](https://github.com/scriptedbyrahul/k8sCerteExpiryAlerts.git)
+cd k8sCerteExpiryAlerts
 ```
 ## Update alert_config.yaml
 ```bash
