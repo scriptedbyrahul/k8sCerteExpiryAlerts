@@ -62,7 +62,7 @@ Role/ServiceAccount provides limited RBAC read access.
 ```bash
 git clone https://github.com/<your-org>/<repo-name>.git
 cd <repo-name>
-
+```
 ## Update alert_config.yaml
 ```bash
 SMTP_HOST: smtp.yourdomain.com
