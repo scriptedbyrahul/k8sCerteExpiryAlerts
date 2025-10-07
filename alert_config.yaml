@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ssl-expiry-alery-job-config
+  namespace: prod
+data:
+  SMTP_HOST: smtp_host
+  SMTP_PORT: "587"
+  SMTP_USER: <smtp_user>
+  SMTP_FROM_EMAIL: from_email
+  SMTP_TO_EMAILS: to_email1@email.com,to_email2@email.com
+  SMTP_USE_TLS: "true"
+  ALERT_ON_EMAIL: "True"
+  ALERT_ON_TEAMS: "True"
+  ENVIRONMENT: "Production Main"
