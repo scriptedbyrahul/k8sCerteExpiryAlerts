@@ -75,3 +75,40 @@ ALERT_ON_EMAIL: "True"
 ALERT_ON_TEAMS: "True"
 ENVIRONMENT: "Production Main"
 ```
+
+## 🔒 Create Required Secrets
+
+SMTP Password Secret
+```bash
+kubectl create secret generic smtp-secure-connection \
+  --from-literal=password="<your-smtp-password>" \
+  -n prod
+```
+Teams Webhook Secret (manual method)
+```bash
+kubectl create secret generic certexpiry-teams-webhook \
+  --from-literal=webhook="<your-teams-webhook-url>" \
+  -n prod
+```
+(Optional) If using Vault/ExternalSecrets, update and apply:
+```bash
+kubectl apply -f teams-webhook-external-secret.yaml -n prod
+```
+
+## ⚡ Script ConfigMap
+
+Ensure your Python script cert_alert.py is present inside alert_script.yaml.
+
+## 🛡️ RBAC Setup
+
+Apply role_sa.yaml to configure the ServiceAccount and Role.
+
+3️⃣ Apply the Kubernetes Resources
+```bash
+kubectl apply -f alert_config.yaml -n prod
+kubectl apply -f alert_script.yaml -n prod
+kubectl apply -f role_sa.yaml -n prod
+kubectl apply -f alert_cronjob.yaml -n prod
+# Optional (if using ExternalSecrets for Teams)
+kubectl apply -f teams-webhook-external-secret.yaml -n prod
+```
