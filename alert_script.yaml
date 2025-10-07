@@ -21,7 +21,7 @@ data:
     EMAIL_ENABLED = os.getenv("ALERT_ON_EMAIL","Not Defined")
     TEAMS_ENABLED = os.getenv("ALERT_ON_TEAMS","Not Defined")
     ENVIRONMENT  = os.getenv("ENVIRONMENT","Not Defined")
-    EXPIRY_DAYS = int(os.getenv("EXPIRY_DAYS", "30"))   # <-- NEW CONFIGURABLE VALUE
+    EXPIRY_DAYS = int(os.getenv("EXPIRY_DAYS", "30"))  
 
     EMAIL_CONFIG = {
         'smtp_server': os.getenv('SMTP_HOST', 'smtp.sendgrid.net'),
@@ -212,7 +212,7 @@ data:
         init_k8s()
 
         namespace = None  
-        days_before_expiry = EXPIRY_DAYS   # <-- USE ENV VALUE
+        days_before_expiry = EXPIRY_DAYS   
 
         all_certs = []
 
