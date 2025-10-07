@@ -13,3 +13,5 @@ data:
   ALERT_ON_EMAIL: "True"
   ALERT_ON_TEAMS: "True"
   ENVIRONMENT: "Production Main"
+  EXPIRY_DAYS: "30"
+
